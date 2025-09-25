@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 
-app = FastAPI(title="Sector Score API", version="1.0")
+app = FastAPI(title="Sector API Bearish", version="1.0")
 
 DEFAULT_TICKERS = ["XLK","XLF","XLV","XLE","XLI","XLY","XLP","XLU","XLRE","XLB","XLC"]
 EASTERN = pytz.timezone("US/Eastern")
@@ -14,10 +14,6 @@ OPEN_TIME = dt.time(9, 30)
 CUTOFF_TIME = dt.time(9, 45)
 REGULAR_MINUTES = 390.0
 SLICE_MINUTES = 15.0
-
-@app.get("/")
-def read_root():
-    return {"status": "healthy", "message": "Sector Score API is running"}
 
 def find_last_trading_date(date_guess, ticker="SPY"):
     # Walk back up to 10 days to find a date with 1m data
@@ -60,11 +56,6 @@ def fetch_intraday_1m(ticker, date_et):
                      prepost=True, progress=False, auto_adjust=False, threads=False)
     if df.empty:
         return df
-    
-    # Handle MultiIndex columns from yfinance
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    
     if df.index.tz is None:
         df = df.tz_localize("UTC")
     df = df.tz_convert(EASTERN)
@@ -76,11 +67,6 @@ def fetch_daily(ticker):
                      auto_adjust=False, progress=False, threads=False)
     if df.empty:
         return df
-    
-    # Handle MultiIndex columns from yfinance
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    
     df = df.rename(columns=str.lower)
     return df
 
@@ -193,17 +179,5 @@ def sectors(tickers: Optional[str] = None, date: Optional[str] = None):
     rows = [compute_score_for_ticker(t, date_et, asof_dt_et) for t in tick_list]
     good = [r for r in rows if "strength_score" in r]
     good.sort(key=lambda r: r["strength_score"], reverse=True)
-    
-    # Changed to get bottom 4 sectors instead of top 4
-    bottom4 = [r["ticker"] for r in good[-4:]] if len(good) >= 4 else [r["ticker"] for r in good]
-    
+    bottom4 = [r["ticker"] for r in good[-4:]]
     return {"date": str(date_et), "bottom4": bottom4, "rows": good}
-
-@app.get("/test")
-def test():
-    """Test endpoint to verify API is running"""
-    return {
-        "status": "working",
-        "time": str(dt.datetime.now()),
-        "message": "API is running. Note: Yahoo Finance may block some requests from cloud servers."
-    }
