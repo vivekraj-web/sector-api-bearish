@@ -1,7 +1,6 @@
-fastapi==0.109.0
-uvicorn==0.27.0
-pandas==2.1.4
-numpy==1.26.3
-yfinance==0.2.33
-pytz==2023.3.post1
-python-multipart==0.0.6
+fastapi==0.112.2
+uvicorn==0.30.6
+yfinance==0.2.66
+pandas==2.3.2
+pytz==2025.2
+numpy==2.3.3
