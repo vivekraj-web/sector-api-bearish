@@ -1,5 +1,4 @@
-# Use Python from GitHub Container Registry instead of Docker Hub
-FROM ghcr.io/astral-sh/python:3.11-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -15,7 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY sector_api_modified.py .
 
-# Expose the port
+# Expose port
 EXPOSE 8000
 
 # Run the application
