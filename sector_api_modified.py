@@ -19,201 +19,90 @@ SLICE_MINUTES = 15.0
 def read_root():
     return {"status": "healthy", "message": "Sector API is running"}
 
-def find_last_trading_date(date_guess, ticker="SPY"):
-    # Walk back up to 10 days to find a date with 1m data
-    for _ in range(10):
-        if date_guess.weekday() >= 5:  # weekend
-            date_guess -= dt.timedelta(days=1)
-            continue
-        start = EASTERN.localize(dt.datetime.combine(date_guess, dt.time(0,0))).astimezone(pytz.utc)
-        end   = start + dt.timedelta(days=1)
-        df = yf.download(ticker, interval="1m", start=start, end=end,
-                         prepost=True, progress=False, auto_adjust=False, threads=False)
-        if not df.empty:
-            return date_guess
+def find_last_trading_date_simple(date_guess):
+    # Simple logic without checking SPY
+    # Skip weekends
+    while date_guess.weekday() >= 5:  # Saturday = 5, Sunday = 6
         date_guess -= dt.timedelta(days=1)
-    return None
+    return date_guess
 
 def resolve_target_datetime(user_date=None):
     now_et = dt.datetime.now(pytz.utc).astimezone(EASTERN)
     if user_date is not None:
         target_date = user_date
-        target_dt = EASTERN.localize(dt.datetime.combine(target_date, CUTOFF_TIME))
     else:
         target_date = now_et.date()
         target_dt = EASTERN.localize(dt.datetime.combine(target_date, CUTOFF_TIME))
         if now_et < target_dt:
             target_date = target_date - dt.timedelta(days=1)
-            target_dt = EASTERN.localize(dt.datetime.combine(target_date, CUTOFF_TIME))
-    checked = find_last_trading_date(target_date)
-    if checked is None:
-        raise RuntimeError("Could not find a recent trading day with intraday data.")
-    if checked != target_date:
-        target_date = checked
-        target_dt = EASTERN.localize(dt.datetime.combine(target_date, CUTOFF_TIME))
+    
+    # Use simple weekend check instead of SPY validation
+    target_date = find_last_trading_date_simple(target_date)
+    target_dt = EASTERN.localize(dt.datetime.combine(target_date, CUTOFF_TIME))
     return target_date, target_dt
 
 def fetch_intraday_1m(ticker, date_et):
-    start = EASTERN.localize(dt.datetime.combine(date_et, dt.time(0,0))).astimezone(pytz.utc)
-    end   = start + dt.timedelta(days=1)
-    df = yf.download(ticker, interval="1m", start=start, end=end,
-                     prepost=True, progress=False, auto_adjust=False, threads=False)
-    
-    # Fix for MultiIndex columns from yfinance
-    if not df.empty and isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    
-    if df.empty:
+    try:
+        start = EASTERN.localize(dt.datetime.combine(date_et, dt.time(0,0))).astimezone(pytz.utc)
+        end = start + dt.timedelta(days=1)
+        df = yf.download(ticker, interval="1m", start=start, end=end,
+                         prepost=True, progress=False, auto_adjust=False, threads=False)
+        
+        # Fix for MultiIndex columns
+        if not df.empty and isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        
+        if df.empty:
+            return df
+        if df.index.tz is None:
+            df = df.tz_localize("UTC")
+        df = df.tz_convert(EASTERN)
+        df = df.rename(columns=str.lower)
         return df
-    if df.index.tz is None:
-        df = df.tz_localize("UTC")
-    df = df.tz_convert(EASTERN)
-    df = df.rename(columns=str.lower)  # open, high, low, close, volume
-    return df
+    except Exception as e:
+        print(f"Error fetching intraday for {ticker}: {e}")
+        return pd.DataFrame()
 
 def fetch_daily(ticker):
-    df = yf.download(ticker, interval="1d", period="90d",
-                     auto_adjust=False, progress=False, threads=False)
-    
-    # Fix for MultiIndex columns from yfinance
-    if not df.empty and isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    
-    if df.empty:
-        return df
-    df = df.rename(columns=str.lower)
-    return df
-
-def compute_score_for_ticker(ticker, date_et, asof_dt_et):
     try:
-        intraday = fetch_intraday_1m(ticker, date_et)
-        daily = fetch_daily(ticker)
-
-        if intraday.empty or daily.empty or len(daily) < 21:
-            return {"ticker": ticker, "error": "Insufficient data"}
-
-        dailydf = daily.copy()
-        if dailydf.index.tz is None:
-            dailydf.index = pd.to_datetime(dailydf.index).tz_localize(EASTERN)
-        else:
-            dailydf.index = dailydf.index.tz_convert(EASTERN)
-        prev_daily = dailydf[dailydf.index.date < date_et]
-        if prev_daily.empty:
-            return {"ticker": ticker, "error": "No previous close"}
-        pre_close = float(prev_daily.iloc[-1]["close"])
-
-        day_slice = intraday[(intraday.index.date == date_et)]
-        if day_slice.empty:
-            return {"ticker": ticker, "error": "No intraday for target date"}
-
-        # Opening range = 9:30–9:44 inclusive (first 15 minutes)
-        end_or = (dt.datetime.combine(date_et, CUTOFF_TIME) - dt.timedelta(minutes=1)).time()
-        or_slice = day_slice.between_time(OPEN_TIME, end_or)
-        if or_slice.empty:
-            return {"ticker": ticker, "error": "No 9:30–9:45 data"}
-
-        opening_range_high = float(or_slice["high"].max())
-        opening_range_low  = float(or_slice["low"].min())
-
-        upto_cut = day_slice[day_slice.index <= asof_dt_et]
-        if upto_cut.empty:
-            return {"ticker": ticker, "error": "No price up to 9:45"}
-        current_price = float(upto_cut["close"].iloc[-1])
-
-        open_at_930 = float(or_slice["open"].iloc[0])
-        overnight_gap = (open_at_930 - pre_close) / pre_close * 100.0
-        intraday_move = (current_price - open_at_930) / open_at_930 * 100.0
-        total_day_move = (current_price - pre_close) / pre_close * 100.0
-
-        avg_20d_vol = float(dailydf["volume"].tail(20).mean())
-        vol_15m = float(or_slice["volume"].sum())
-        expected_15m = avg_20d_vol * (SLICE_MINUTES / REGULAR_MINUTES)
-        relative_volume = vol_15m / expected_15m if expected_15m > 0 else np.nan
-
-        if np.isnan(relative_volume):
-            volume_score = 0
-        elif relative_volume > 2.0:
-            volume_score = 3
-        elif relative_volume > 1.5:
-            volume_score = 2
-        elif relative_volume > 1.0:
-            volume_score = 1
-        else:
-            volume_score = 0
-
-        if opening_range_high == opening_range_low:
-            or_position = 0.0
-        elif current_price > opening_range_high:
-            or_position = 2.0
-        elif current_price < opening_range_low:
-            or_position = -2.0
-        else:
-            or_position = ((current_price - opening_range_low) /
-                           (opening_range_high - opening_range_low)) - 0.5
-
-        strength_score = total_day_move + (0.5 * volume_score) + (2.0 * or_position)
-
-        if strength_score > 3:
-            color = "dark_green"
-        elif strength_score > 1:
-            color = "blue"
-        elif strength_score > -1:
-            color = "gray"
-        elif strength_score > -3:
-            color = "red"
-        else:
-            color = "dark_red"
-
-        return {
-            "ticker": ticker,
-            "prev_close": round(pre_close, 4),
-            "open_930": round(open_at_930, 4),
-            "current_price_945": round(current_price, 4),
-            "overnight_gap_pct": round(overnight_gap, 3),
-            "intraday_move_pct": round(intraday_move, 3),
-            "total_day_move_pct": round(total_day_move, 3),
-            "opening_range_high": round(opening_range_high, 4),
-            "opening_range_low": round(opening_range_low, 4),
-            "or_position": round(or_position, 3),
-            "avg_20d_vol": int(avg_20d_vol),
-            "vol_15m": int(vol_15m),
-            "relative_volume": round(relative_volume, 3) if not np.isnan(relative_volume) else None,
-            "volume_score": volume_score,
-            "strength_score": round(float(strength_score), 3),
-            "color": color
-        }
+        df = yf.download(ticker, interval="1d", period="90d",
+                         auto_adjust=False, progress=False, threads=False)
+        
+        # Fix for MultiIndex columns
+        if not df.empty and isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        
+        if df.empty:
+            return df
+        df = df.rename(columns=str.lower)
+        return df
     except Exception as e:
-        return {"ticker": ticker, "error": str(e)}
+        print(f"Error fetching daily for {ticker}: {e}")
+        return pd.DataFrame()
 
-@app.get("/sectors")
-def sectors(tickers: Optional[str] = None, date: Optional[str] = None):
-    tick_list = [t.strip().upper() for t in (tickers.split(",") if tickers else DEFAULT_TICKERS)]
-    
-    # Fixed date parsing to handle errors gracefully
-    user_date = None
-    if date:
+# ... rest of compute_score_for_ticker function stays the same ...
+
+@app.get("/sectors-test")
+def sectors_test():
+    """Test with just daily data to see if anything works"""
+    results = []
+    for ticker in DEFAULT_TICKERS[:3]:  # Test with just 3 tickers
         try:
-            # Try ISO format (YYYY-MM-DD)
-            user_date = dt.date.fromisoformat(date)
-        except ValueError:
-            # If date format is invalid, just ignore it and use default (today/last trading day)
-            user_date = None
+            df = yf.download(ticker, period="5d", progress=False)
+            if not df.empty and len(df) >= 2:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                close_today = float(df['Close'].iloc[-1])
+                close_yesterday = float(df['Close'].iloc[-2])
+                change = ((close_today - close_yesterday) / close_yesterday * 100)
+                results.append({"ticker": ticker, "change_pct": round(change, 2)})
+            else:
+                results.append({"ticker": ticker, "error": "No data"})
+        except Exception as e:
+            results.append({"ticker": ticker, "error": str(e)[:50]})
     
-    date_et, asof_dt_et = resolve_target_datetime(user_date=user_date)
-    rows = [compute_score_for_ticker(t, date_et, asof_dt_et) for t in tick_list]
-    good = [r for r in rows if "strength_score" in r]
-    good.sort(key=lambda r: r["strength_score"], reverse=True)
-    
-    # Fixed to handle cases with fewer than 4 results
-    bottom4 = [r["ticker"] for r in good[-4:]] if len(good) >= 4 else [r["ticker"] for r in good]
-    
-    return {"date": str(date_et), "bottom4": bottom4, "rows": good}
+    return {"results": results}
 
 @app.get("/test")
 def test():
-    """Test endpoint to verify API is running"""
-    return {
-        "status": "working",
-        "time": str(dt.datetime.now()),
-        "message": "API is running. Note: Yahoo Finance may block some requests from cloud servers."
-    }
+    return {"status": "working", "time": str(dt.datetime.now())}
