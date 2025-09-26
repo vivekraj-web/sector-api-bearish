@@ -15,6 +15,10 @@ CUTOFF_TIME = dt.time(9, 45)
 REGULAR_MINUTES = 390.0
 SLICE_MINUTES = 15.0
 
+@app.get("/")
+def read_root():
+    return {"status": "healthy", "message": "Sector API is running"}
+
 def find_last_trading_date(date_guess, ticker="SPY"):
     # Walk back up to 10 days to find a date with 1m data
     for _ in range(10):
@@ -54,6 +58,11 @@ def fetch_intraday_1m(ticker, date_et):
     end   = start + dt.timedelta(days=1)
     df = yf.download(ticker, interval="1m", start=start, end=end,
                      prepost=True, progress=False, auto_adjust=False, threads=False)
+    
+    # Fix for MultiIndex columns from yfinance
+    if not df.empty and isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    
     if df.empty:
         return df
     if df.index.tz is None:
@@ -65,6 +74,11 @@ def fetch_intraday_1m(ticker, date_et):
 def fetch_daily(ticker):
     df = yf.download(ticker, interval="1d", period="90d",
                      auto_adjust=False, progress=False, threads=False)
+    
+    # Fix for MultiIndex columns from yfinance
+    if not df.empty and isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    
     if df.empty:
         return df
     df = df.rename(columns=str.lower)
@@ -174,10 +188,32 @@ def compute_score_for_ticker(ticker, date_et, asof_dt_et):
 @app.get("/sectors")
 def sectors(tickers: Optional[str] = None, date: Optional[str] = None):
     tick_list = [t.strip().upper() for t in (tickers.split(",") if tickers else DEFAULT_TICKERS)]
-    user_date = dt.date.fromisoformat(date) if date else None
+    
+    # Fixed date parsing to handle errors gracefully
+    user_date = None
+    if date:
+        try:
+            # Try ISO format (YYYY-MM-DD)
+            user_date = dt.date.fromisoformat(date)
+        except ValueError:
+            # If date format is invalid, just ignore it and use default (today/last trading day)
+            user_date = None
+    
     date_et, asof_dt_et = resolve_target_datetime(user_date=user_date)
     rows = [compute_score_for_ticker(t, date_et, asof_dt_et) for t in tick_list]
     good = [r for r in rows if "strength_score" in r]
     good.sort(key=lambda r: r["strength_score"], reverse=True)
-    bottom4 = [r["ticker"] for r in good[-4:]]
+    
+    # Fixed to handle cases with fewer than 4 results
+    bottom4 = [r["ticker"] for r in good[-4:]] if len(good) >= 4 else [r["ticker"] for r in good]
+    
     return {"date": str(date_et), "bottom4": bottom4, "rows": good}
+
+@app.get("/test")
+def test():
+    """Test endpoint to verify API is running"""
+    return {
+        "status": "working",
+        "time": str(dt.datetime.now()),
+        "message": "API is running. Note: Yahoo Finance may block some requests from cloud servers."
+    }
